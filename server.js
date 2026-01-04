@@ -162,6 +162,18 @@ app.delete('/api/auctions/:id', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
+// NEW: Update Auction Password
+app.put('/api/auctions/:id', async (req, res) => {
+    try {
+        const { accessCode } = req.body;
+        // Update only the password (accessCode)
+        await Auction.findByIdAndUpdate(req.params.id, { accessCode });
+        res.json({ success: true, message: "Password updated" });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 // --- SOCKET.IO ---
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket', 'polling'] });
 
