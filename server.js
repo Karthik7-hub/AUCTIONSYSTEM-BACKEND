@@ -163,13 +163,16 @@ app.delete('/api/auctions/:id', async (req, res) => {
     }
 });
 
-// NEW: Update Auction Password
 app.put('/api/auctions/:id', async (req, res) => {
     try {
-        const { accessCode } = req.body;
-        // Update only the password (accessCode)
-        await Auction.findByIdAndUpdate(req.params.id, { accessCode });
-        res.json({ success: true, message: "Password updated" });
+        const updates = req.body;
+        const updatedAuction = await Auction.findByIdAndUpdate(
+            req.params.id,
+            updates,
+            { new: true } // Return the updated document
+        );
+
+        res.json({ success: true, auction: updatedAuction });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
