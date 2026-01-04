@@ -127,6 +127,39 @@ app.delete('/api/players/:id', async (req, res) => {
     res.json({ message: "Deleted" });
 });
 
+// --- SUPER ADMIN ROUTES ---
+
+// 1. Verify Master Password
+// server.js
+
+app.post('/api/super-admin/login', (req, res) => {
+    // CHANGE 'superadmin123' TO YOUR NEW PASSWORD BELOW
+    if (req.body.password === 'MY_NEW_SECRET_PASSWORD') {
+        res.json({ success: true });
+    } else {
+        res.status(401).json({ success: false });
+    }
+});
+
+// 2. Delete Entire Auction (Cascade Delete)
+app.delete('/api/auctions/:id', async (req, res) => {
+    try {
+        const auctionId = req.params.id;
+
+        // 1. Delete Auction
+        await Auction.findByIdAndDelete(auctionId);
+
+        // 2. Delete All Linked Teams
+        await Team.deleteMany({ auctionId });
+
+        // 3. Delete All Linked Players
+        await Player.deleteMany({ auctionId });
+
+        res.json({ success: true, message: "Auction and all data deleted" });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 // --- SOCKET.IO ---
 const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket', 'polling'] });
 
