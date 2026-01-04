@@ -39,6 +39,8 @@ Thumbs.db
 *.swp
 *.swo
 
+.env
+
 # Testing
 coverage/
 
