@@ -5,6 +5,8 @@ const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
 
+// Import Models
+const Auction = require('./models/Auction');
 const Team = require('./models/Team');
 const Player = require('./models/Player');
 
@@ -14,167 +16,198 @@ const server = http.createServer(app);
 app.use(cors());
 app.use(express.json());
 
-// --- SOCKET.IO SETUP (For Live Auction) ---
-const io = new Server(server, {
-    cors: {
-        origin: "*", // Allow React Frontend to connect
-        methods: ["GET", "POST"]
-    }
-});
-// --- DATABASE CONNECTION ---
-mongoose.connect(process.env.MONGO_URI)
-    .then(() => console.log("✅ MongoDB Connected"))
-    .catch(err => console.error("❌ DB Error:", err));
+// --- MULTI-AUCTION STATE MANAGEMENT ---
+const auctionRooms = new Map();
 
-// --- REAL-TIME STATE ---
-let auctionState = {
-    currentBid: 0,
-    leadingTeamId: null,
-    currentPlayerId: null,
-    status: 'IDLE' // IDLE, ACTIVE, SOLD, UNSOLD
-};
-
-// --- API ROUTES ---
-
-// Initialize Data
-app.get('/api/init', async (req, res) => {
-    try {
-        const teams = await Team.find().populate('players');
-        const players = await Player.find().sort('order');
-        res.json({ teams, players });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Add Team
-app.post('/api/teams', async (req, res) => {
-    const team = new Team(req.body);
-    await team.save();
-    io.emit('data_update');
-    res.json(team);
-});
-
-// Add Player
-app.post('/api/players', async (req, res) => {
-    const count = await Player.countDocuments();
-    const player = new Player({ ...req.body, order: count });
-    await player.save();
-    io.emit('data_update');
-    res.json(player);
-});
-// --- ADD THESE NEW DELETE ROUTES ---
-
-// Delete a specific team
-app.delete('/api/teams/:id', async (req, res) => {
-    await Team.findByIdAndDelete(req.params.id);
-    // Optional: If you want to reset players bought by this team
-    await Player.updateMany({ soldTo: req.params.id }, { isSold: false, soldTo: null, soldPrice: 0 });
-    io.emit('data_update');
-    res.json({ message: "Team deleted" });
-});
-
-// DELETE PLAYER ROUTE
-app.delete('/api/players/:id', async (req, res) => {
-    try {
-        const player = await Player.findById(req.params.id);
-
-        if (!player) return res.status(404).json({ message: "Player not found" });
-
-        // 1. If player was sold, remove them from the Team & Refund Budget
-        if (player.isSold && player.soldTo) {
-            const team = await Team.findById(player.soldTo);
-            if (team) {
-                team.players = team.players.filter(pId => pId.toString() !== player._id.toString()); // Remove ID
-                team.spent -= player.soldPrice; // Refund money
-                await team.save();
-            }
-        }
-
-        // 2. Now delete the player
-        await Player.findByIdAndDelete(req.params.id);
-
-        res.json({ message: "Player deleted and team updated" });
-    } catch (err) {
-        res.status(500).json({ message: err.message });
-    }
-});
-// ... keep existing socket.io logic ...
-
-// --- SOCKET.IO HANDLERS ---
-io.on('connection', (socket) => {
-    socket.emit('auction_state', auctionState);
-    // ... inside io.on('connection') ...
-
-    socket.on('start_player', async ({ playerId, basePrice }) => {
-        auctionState = {
-            currentBid: basePrice, // FORCE the bid to start at Base Price
-            leadingTeamId: null,
-            currentPlayerId: playerId,
-            status: 'ACTIVE'
-        };
-        io.emit('auction_state', auctionState);
-    });
-
-    // ... keep other handlers ...
-    socket.on('place_bid', ({ teamId, amount }) => {
-        auctionState.currentBid = amount;
-        auctionState.leadingTeamId = teamId;
-        io.emit('auction_state', auctionState);
-    });
-
-    // --- UPDATED SOLD LOGIC ---
-    socket.on('sell_player', async () => {
-        const { currentPlayerId, leadingTeamId, currentBid } = auctionState;
-        if (currentPlayerId && leadingTeamId) {
-            await Player.findByIdAndUpdate(currentPlayerId, {
-                isSold: true,
-                isUnsold: false, // Ensure it's not marked unsold
-                soldTo: leadingTeamId,
-                soldPrice: currentBid
-            });
-
-            const team = await Team.findById(leadingTeamId);
-            team.spent += currentBid;
-            team.players.push(currentPlayerId);
-            await team.save();
-
-            auctionState.status = 'SOLD';
-            io.emit('auction_state', auctionState);
-            io.emit('data_update');
-        }
-    });
-
-
-
-    // --- UPDATED UNSOLD LOGIC ---
-    socket.on('unsell_player', async () => {
-        const { currentPlayerId } = auctionState;
-        if (currentPlayerId) {
-            // Mark player as Unsold in DB so they are removed from the main queue
-            await Player.findByIdAndUpdate(currentPlayerId, {
-                isSold: false,
-                isUnsold: true
-            });
-
-            auctionState.status = 'UNSOLD';
-            io.emit('auction_state', auctionState);
-            io.emit('data_update');
-        }
-    });
-
-    // NEW: Reset round to IDLE state (clears the screen)
-    socket.on('reset_round', () => {
-        auctionState = {
+const getRoomState = (auctionId) => {
+    if (!auctionRooms.has(auctionId)) {
+        auctionRooms.set(auctionId, {
             currentBid: 0,
             leadingTeamId: null,
             currentPlayerId: null,
-            status: 'IDLE'
-        };
-        io.emit('auction_state', auctionState);
+            status: 'IDLE',
+            bidHistory: []
+        });
+    }
+    return auctionRooms.get(auctionId);
+};
+
+// --- DATABASE ---
+mongoose.connect(process.env.MONGO_URI)
+    .then(() => console.log("✅ Scalable DB Connected"))
+    .catch(err => console.error("❌ DB Error:", err));
+
+// --- API ROUTES ---
+
+// 1. Create Auction
+app.post('/api/create-auction', async (req, res) => {
+    try {
+        const auction = new Auction(req.body);
+        await auction.save();
+        res.json(auction);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 2. List Auctions
+app.get('/api/auctions', async (req, res) => {
+    const auctions = await Auction.find({ isActive: true });
+    res.json(auctions);
+});
+
+// 3. Init Specific Auction Data
+app.get('/api/init/:auctionId', async (req, res) => {
+    try {
+        const { auctionId } = req.params;
+        const teams = await Team.find({ auctionId }).populate('players').lean();
+        const players = await Player.find({ auctionId }).sort('order').lean();
+        const liveState = getRoomState(auctionId);
+        res.json({ teams, players, liveState });
+    } catch (err) { res.status(500).json({ error: "Failed to load data" }); }
+});
+
+// 4. Verify Admin Password
+app.post('/api/verify-admin', async (req, res) => {
+    try {
+        const { auctionId, password } = req.body;
+        const auction = await Auction.findById(auctionId);
+        if (!auction) return res.status(404).json({ success: false });
+
+        if (auction.accessCode === password) return res.json({ success: true });
+        else return res.status(401).json({ success: false });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 5. Add/Delete Logic (Scoped to AuctionId)
+app.post('/api/teams', async (req, res) => {
+    const team = new Team(req.body);
+    await team.save();
+    io.to(req.body.auctionId).emit('data_update');
+    res.json(team);
+});
+
+app.post('/api/players', async (req, res) => {
+    const count = await Player.countDocuments({ auctionId: req.body.auctionId });
+    const player = new Player({ ...req.body, order: count });
+    await player.save();
+    io.to(req.body.auctionId).emit('data_update');
+    res.json(player);
+});
+
+app.delete('/api/teams/:id', async (req, res) => {
+    const team = await Team.findById(req.params.id);
+    if (team) {
+        const auctionId = team.auctionId.toString();
+        await Team.findByIdAndDelete(req.params.id);
+        await Player.updateMany({ soldTo: req.params.id }, { isSold: false, soldTo: null, soldPrice: 0 });
+        io.to(auctionId).emit('data_update');
+    }
+    res.json({ message: "Deleted" });
+});
+
+app.delete('/api/players/:id', async (req, res) => {
+    const player = await Player.findById(req.params.id);
+    if (player) {
+        const auctionId = player.auctionId.toString();
+        if (player.isSold && player.soldTo) {
+            await Team.findByIdAndUpdate(player.soldTo, { $pull: { players: player._id }, $inc: { spent: -player.soldPrice } });
+        }
+        await Player.findByIdAndDelete(req.params.id);
+        io.to(auctionId).emit('data_update');
+    }
+    res.json({ message: "Deleted" });
+});
+
+// --- SOCKET.IO ---
+const io = new Server(server, { cors: { origin: "*" }, transports: ['websocket', 'polling'] });
+
+io.on('connection', (socket) => {
+
+    socket.on('join_auction', (auctionId) => {
+        socket.join(auctionId);
+        socket.emit('auction_state', getRoomState(auctionId));
+    });
+
+    socket.on('start_player', ({ auctionId, playerId, basePrice }) => {
+        const state = getRoomState(auctionId);
+        state.currentBid = basePrice;
+        state.leadingTeamId = null;
+        state.currentPlayerId = playerId;
+        state.status = 'ACTIVE';
+        state.bidHistory = []; // Reset history
+        io.to(auctionId).emit('auction_state', state);
+    });
+
+    socket.on('place_bid', ({ auctionId, teamId, amount }) => {
+        const state = getRoomState(auctionId);
+
+        if (state.leadingTeamId === null) {
+            if (amount < state.currentBid) return;
+        } else {
+            if (amount <= state.currentBid) return;
+        }
+
+        // Save History
+        state.bidHistory.push({ bid: state.currentBid, leader: state.leadingTeamId });
+
+        state.currentBid = amount;
+        state.leadingTeamId = teamId;
+        io.to(auctionId).emit('auction_state', state);
+    });
+
+    socket.on('undo_bid', ({ auctionId }) => {
+        const state = getRoomState(auctionId);
+        if (state.bidHistory.length > 0) {
+            const prev = state.bidHistory.pop();
+            state.currentBid = prev.bid;
+            state.leadingTeamId = prev.leader;
+            io.to(auctionId).emit('auction_state', state);
+        }
+    });
+
+    socket.on('toggle_pause', ({ auctionId }) => {
+        const state = getRoomState(auctionId);
+        state.status = state.status === 'PAUSED' ? 'ACTIVE' : 'PAUSED';
+        io.to(auctionId).emit('auction_state', state);
+    });
+
+    socket.on('sell_player', async ({ auctionId }) => {
+        const state = getRoomState(auctionId);
+        const { currentPlayerId, leadingTeamId, currentBid } = state;
+
+        if (currentPlayerId && leadingTeamId) {
+            state.status = 'SOLD';
+            state.bidHistory = [];
+            io.to(auctionId).emit('auction_state', state);
+
+            try {
+                await Promise.all([
+                    Player.findByIdAndUpdate(currentPlayerId, { isSold: true, soldTo: leadingTeamId, soldPrice: currentBid }),
+                    Team.findByIdAndUpdate(leadingTeamId, { $inc: { spent: currentBid }, $push: { players: currentPlayerId } })
+                ]);
+                io.to(auctionId).emit('data_update');
+            } catch (err) { console.error(err); }
+        }
+    });
+
+    socket.on('unsell_player', async ({ auctionId }) => {
+        const state = getRoomState(auctionId);
+        if (state.currentPlayerId) {
+            state.status = 'UNSOLD';
+            io.to(auctionId).emit('auction_state', state);
+            await Player.findByIdAndUpdate(state.currentPlayerId, { isSold: false, isUnsold: true });
+            io.to(auctionId).emit('data_update');
+        }
+    });
+
+    socket.on('reset_round', ({ auctionId }) => {
+        const state = getRoomState(auctionId);
+        state.currentBid = 0;
+        state.leadingTeamId = null;
+        state.currentPlayerId = null;
+        state.status = 'IDLE';
+        io.to(auctionId).emit('auction_state', state);
     });
 });
 
-
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Scalable Server running on port ${PORT}`));

@@ -1,10 +1,11 @@
 const mongoose = require('mongoose');
 
 const TeamSchema = new mongoose.Schema({
-    name: { type: String, required: true },
-    budget: { type: Number, required: true },
+    auctionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Auction', required: true },
+    name: String,
+    budget: Number,
     spent: { type: Number, default: 0 },
-    color: { type: String, default: '#000000' },
+    color: String,
     players: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Player' }]
 });
 
